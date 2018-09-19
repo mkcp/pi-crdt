@@ -49,10 +49,13 @@
   (id-initialize! id))
 
 (defn message-receive
-  "Takes a serialized value of p and merges it into local p"
-  [msg]
-  (let [p' (read-string msg)]
-    (p-merge! p')))
+  "Takes a serialized value of p' from `msg` and merges it into local p"
+  [{:keys [nodes id]} msg]
+  (let [p  (get-in @g-counter [:p id])
+        p' (read-string msg)]
+    (when (and (= (count p') nodes)
+               (<= (nth p' id) p))
+      (p-merge! p'))))
 
 (defn message-create
   "Reads and serializes the current local value of p "
@@ -75,23 +78,23 @@
     (.flush writer)))
 
 (defn serve!
-  [{:keys [port id]} handler-in handler-out]
+  [{:keys [port id] :as opts} handler-in handler-out]
   (let [running (atom true)]
     (future
       (with-open [server-sock (ServerSocket. (+ port id))]
         (while @running
           (with-open [sock (.accept server-sock)]
-            (let [msg-in (-> sock receive! handler-in)
+            (let [msg-in (->> sock receive! (handler-in opts))
                   msg-out (handler-out)]
               (send! sock msg-out))))))
     running))
 
 (defn exponential-backoff [time rate max f]
-  (if (>= time max) ;; we're over budget, just call f
+  (if (<= max time)
     (f)
     (try
       (f)
-      (catch Throwable t
+      (catch Throwable _
         (Thread/sleep time)
         (exponential-backoff (* time rate) rate max f)))))
 
@@ -101,10 +104,20 @@
   (let [running (atom true)]
     (future
       (while @running
-        (exponential-backoff 100 2 100000
-         #(with-open [sock (Socket. "0.0.0.0" (+ port i))]
-            (send! sock (message-create))))))
+        (try
+          (exponential-backoff
+           100 1.1 10000
+           #(with-open [sock (Socket. "0.0.0.0" (+ port i))]
+              (send! sock (message-create))))
+          (catch Throwable t
+            (println t)))))
     running))
+
+(defn pushers-start
+  [{:keys [addresses nodes] :as opts}]
+  (if-not (:addresses opts)
+    (doall (map #(pusher opts %) (range nodes)))
+    (doall (map #(pusher opts %) addresses))))
 
 (defn local-updater
   "Fires `p-update` each time a user provides a new line"
@@ -129,20 +142,27 @@
 (def cli-options
   [["-i" "--id ID" "Node id"
     :parse-fn #(Integer/parseInt %)]
-   ["-n" "--nodes NODE-COUNT" "Nodes"
+
+   ["-n" "--nodes NODE_COUNT" "Nodes"
      :parse-fn #(Integer/parseInt %)
      :default 5]
-   ["-r" "--repl" "Run in interactive mode"]
+
    ["-p" "--port PORT" "Specify a port to listen on."
     :parse-fn #(Integer/parseInt %)
     :default 6969]
+
+   ["-hosts" "--host-names [hostname,IP:PORT,...]" "Provide a comma delimited array of hostnames or IP:PORT"]
+
    ["-u" "--update-rate MS" "How long to sleep between updates, in milliseconds"
     :parse-fn #(Integer/parseInt %)
     :default 1000]
+
    ["-h" "--help"]])
 
 (defn -main [& args]
   (let [opts (:options (parse-opts args cli-options))
+
+        _ (println opts)
 
         ;; Initialize  node
         _              (g-counter-initialize! opts)
@@ -151,7 +171,7 @@
         _              (println "Listening on port" (+ (:id opts)
                                                        (:port opts)))
 
-        pushers        (map #(pusher opts %) (range (:nodes opts)))
+        pushers        (pushers-start opts)
         _              (println "Pushers started")
 
         console-input  (local-updater)
