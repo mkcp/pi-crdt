@@ -21,7 +21,7 @@
 
 (defn p-update!
   []
-  (swap! g-counter update-in [:p (:id @g-counter)] inc))
+  (swap! g-counter #(update-in % [:p (:id %)] inc)))
 
 (defn p-query
   []
@@ -31,7 +31,7 @@
 (defn p-merge!
   "Takes the max of every element in p"
   [y]
-  (swap! g-counter mapv (max (:p @g-counter) y)))
+  (swap! g-counter update-in [:p] #(mapv max % y)))
 
 (defn p-apply!
   [x]
@@ -50,7 +50,7 @@
 (defn message-receive
   [msg]
   (let [p' (read-string msg)]
-    (p-merge p')))
+    (p-merge! p')))
 
 (defn message-send
   "Reads the current local value of p and serializes it"
@@ -134,7 +134,8 @@
 
         ;; Read out the node's state at the specified interval
         counter-reader (local-reader update-rate)
-        _              (println "Printing local state every" (str update-rate "ms"))]
+  
+      _              (println "Printing local state every" (str update-rate "ms"))]
 
     ;; TODO Push the update to other nodes
     #_(dotimes [i nodes]
