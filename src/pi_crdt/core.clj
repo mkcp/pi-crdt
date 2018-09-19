@@ -1,7 +1,8 @@
 (ns pi-crdt.core
   (:require [clojure.tools.cli :refer [parse-opts]]
             [clojure.java.io :as io])
-  (:import [java.net ServerSocket])
+  (:import [java.net ServerSocket
+                     Socket])
   (:gen-class))
 
 (defonce g-counter (atom {:p []
@@ -42,18 +43,19 @@
   (every? true? (map <= x y)))
 
 (defn g-counter-initialize!
-  [n id]
-  (p-initialize!  n)
-  (n-initialize!  n)
+  [{:keys [nodes id]}]
+  (p-initialize!  nodes)
+  (n-initialize!  nodes)
   (id-initialize! id))
 
 (defn message-receive
+  "Takes a serialized value of p and merges it into local p"
   [msg]
   (let [p' (read-string msg)]
     (p-merge! p')))
 
-(defn message-send
-  "Reads the current local value of p and serializes it"
+(defn message-create
+  "Reads and serializes the current local value of p "
   []
   (-> g-counter
       deref
@@ -73,20 +75,51 @@
     (.flush writer)))
 
 (defn serve!
-  [port handler-in handler-out]
+  [{:keys [port id]} handler-in handler-out]
   (let [running (atom true)]
     (future
-      (with-open [server-sock (ServerSocket. port)
-                  sock (.accept server-sock)]
+      (with-open [server-sock (ServerSocket. (+ port id))]
         (while @running
-          (let [msg-in (-> sock receive! handler-in)
-                msg-out (handler-out msg-in)]
-            (send! sock msg-out)))))
+          (with-open [sock (.accept server-sock)]
+            (let [msg-in (-> sock receive! handler-in)
+                  msg-out (handler-out)]
+              (send! sock msg-out))))))
     running))
 
+(defn exponential-backoff [time rate max f]
+  (if (>= time max) ;; we're over budget, just call f
+    (f)
+    (try
+      (f)
+      (catch Throwable t
+        (Thread/sleep time)
+        (exponential-backoff (* time rate) rate max f)))))
+
+(defn pusher
+  "Push the update to other nodes"
+  [{:keys [port update-rate]} i]
+  (let [running (atom true)]
+    (future
+      (while @running
+        (exponential-backoff 100 2 100000
+         #(with-open [sock (Socket. "0.0.0.0" (+ port i))]
+            (send! sock (message-create))))))
+    running))
+
+(defn local-updater
+  "Fires `p-update` each time a user provides a new line"
+  []
+  (let [running (atom true)]
+    (future
+      (while running
+        (let [input (read-line)]
+          (when input
+            (p-update!))))
+      running)))
 
 (defn local-reader
-  [update-rate]
+  "Read out the node's state at the specified interval"
+  [{:keys [update-rate]}]
   (let [running (atom true)]
     (future
       (while @running
@@ -109,34 +142,21 @@
    ["-h" "--help"]])
 
 (defn -main [& args]
-  (let [o (parse-opts args cli-options)
-        {:keys [id
-                nodes
-                repl
-                port
-                update-rate]} (:options o)
-        port    (+ port id)
+  (let [opts (:options (parse-opts args cli-options))
 
         ;; Initialize  node
-        _   (g-counter-initialize! nodes id)
+        _              (g-counter-initialize! opts)
 
-        ;; Start server
-        server (serve! port message-receive message-send)
-        _      (println "Listening on port" port)
+        server         (serve! opts message-receive message-create)
+        _              (println "Listening on port" (+ (:id opts)
+                                                       (:port opts)))
 
-        ;; Increment each time a user provides a new line
-        _ (.start (Thread. (fn []
-                             (loop []
-                               (let [input (read-line)]
-                                 (when input
-                                   (p-update!))
-                                 (recur))))))
+        pushers        (map #(pusher opts %) (range (:nodes opts)))
+        _              (println "Pushers started")
 
-        ;; Read out the node's state at the specified interval
-        counter-reader (local-reader update-rate)
-  
-      _              (println "Printing local state every" (str update-rate "ms"))]
+        console-input  (local-updater)
+        _              (println "Press Enter to increment this node's value")
 
-    ;; TODO Push the update to other nodes
-    #_(dotimes [i nodes]
-      (.start (Thread. (fn [] (serve port )))))))
+        counter-reader (local-reader opts)
+        _              (println "Printing local state every" (str (:update-rate opts) "ms"))]
+    (println "Counter started")))
